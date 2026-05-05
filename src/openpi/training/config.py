@@ -223,8 +223,107 @@ class SimpleDataConfig(DataConfigFactory):
             data_transforms=self.data_transforms(model_config),
             model_transforms=self.model_transforms(model_config),
         )
+import numpy as np
+import torch
 
+@dataclasses.dataclass(frozen=True)
+class GaroInputs(_transforms.DataTransformFn):
+    def __call__(self, data: dict) -> dict:
+        def to_image_array(x):
+            if isinstance(x, torch.Tensor):
+                x = x.cpu().numpy()
+            x = np.asarray(x)
 
+            # CHW -> HWC
+            if x.ndim == 3 and x.shape[0] in [1, 3, 4]:
+                x = np.transpose(x, (1, 2, 0))
+
+            # 혹시 NCHW로 들어오면 첫 장만 사용
+            if x.ndim == 4 and x.shape[0] == 1:
+                x = x[0]
+                if x.shape[0] in [1, 3, 4]:
+                    x = np.transpose(x, (1, 2, 0))
+
+            if x.dtype != np.uint8:
+                if x.max() <= 1.0:
+                    x = x * 255.0
+                x = np.clip(x, 0, 255).astype(np.uint8)
+
+            return x
+
+        data["image"] = {
+            "top": to_image_array(data.pop("observation.images.top")),
+            "wrist_left": to_image_array(data.pop("observation.images.wrist_left")),
+            "wrist_right": to_image_array(data.pop("observation.images.wrist_right")),
+        }
+
+        # 샘플 단위에서는 scalar bool이어야 함. 배치 후 자동으로 (16,) 됨.
+        data["image_mask"] = {
+            "top": np.array(True, dtype=bool),
+            "wrist_left": np.array(True, dtype=bool),
+            "wrist_right": np.array(True, dtype=bool),
+        }
+
+        data["state"] = np.asarray(data.pop("observation.state"), dtype=np.float32)
+        data["actions"] = np.asarray(data.pop("action"), dtype=np.float32)
+
+        return data
+    
+@dataclasses.dataclass(frozen=True)
+class GaroDataConfig(DataConfigFactory):
+    """GARO LeRobot dataset용 DataConfig.
+
+    SimpleDataConfig를 상속하지 않는 이유:
+    - SimpleDataConfig는 기본 data_transforms로 Protocol인 GroupFactory를 만들려고 해서
+      TypeError: Protocols cannot be instantiated 에러가 날 수 있음.
+    - 그래서 GARO용 create()를 직접 정의한다.
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # GARO 데이터셋 key를 openpi 모델이 기대하는 key로 바꿔줌
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        # 이미지 (그대로 매핑)
+                        "observation.images.top": "observation.images.top",
+                        "observation.images.wrist_left": "observation.images.wrist_left",
+                        "observation.images.wrist_right": "observation.images.wrist_right",
+
+                        # state / action
+                        "observation.state": "state",
+                        "action": "actions",
+
+                        # prompt
+                        "prompt": "task",
+                    }
+                )
+            ]
+        )
+
+        # 모델 입력 변환: 이미지 resize, prompt tokenize, state/action padding 등
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=_transforms.Group(
+                inputs=[GaroInputs()],
+            ),
+            model_transforms=model_transforms,
+
+            # MEAN_STD 사용
+            use_quantile_norm=False,
+
+            # action 컬럼 이름
+            action_sequence_keys=("actions",),
+
+            # task 필드에서 prompt 가져오기
+            prompt_from_task=True,
+        )
+    
+    
 @dataclasses.dataclass(frozen=True)
 class LeRobotAlohaDataConfig(DataConfigFactory):
     # If true, will convert joint dimensions to deltas with respect to the current state before passing to the model.
@@ -558,6 +657,50 @@ class TrainConfig:
 
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
+    # -------------------------------------------------------------------------
+    # GARO Pi0.5 Fine-tuning config
+    # -------------------------------------------------------------------------
+    # 기존 pi05_libero는 LIBERO용이므로 GARO 데이터와 key 구조가 맞지 않음.
+    # 따라서 별도 pi05_garo config를 추가해서 사용한다.
+    TrainConfig(
+        name="pi05_garo",
+
+        # GARO action/state는 16차원
+        # action_horizon=50은 기존 GARO 실험 트래커 기준 chunk size
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            discrete_state_input=False,
+        ),
+
+        # GARO LeRobot dataset을 읽는 설정
+        # repo_id는 convert_garo_to_lerobot.py의 REPO_NAME="garo_pi05"와 맞춰야 함
+        data=GaroDataConfig(
+            repo_id="pi05_v01",
+        ),
+
+        # Pi0.5 base checkpoint에서 fine-tuning 시작
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+
+        # 첫 실험용 안정 세팅
+        # 이후 잘 돌면 peak_lr=2.5e-5도 실험 가능
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=1.25e-5,
+            decay_steps=80_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+
+        num_train_steps=20_000,
+        batch_size=16,
+        num_workers=0,
+        save_interval=10_000,
+        log_interval=20,
+    ),
     #
     # Inference Aloha configs.
     #
