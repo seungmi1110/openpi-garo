@@ -41,42 +41,11 @@ REPO_NAME = "garo_pi05"
 # ]
 
 
-# C_tight_square: 이미지 하단 기준 정사각형 크롭 설정
-_CROP_HR = 0.72    # 세로 크롭 비율
-_CENTER_XR = 0.50  # 가로 중심 위치 비율
-
-
-def load_image(
-    image_path: Path, out_size: int = 224, vertical_anchor: str = "bottom"
-) -> np.ndarray:
-    """이미지를 정사각형으로 크롭 후 out_size×out_size로 리사이즈 (비율 유지)"""
-    img = np.array(Image.open(image_path).convert("RGB"))
-    h, w = img.shape[:2]
-
-    crop_h = int(h * _CROP_HR)
-    crop_w = crop_h  # 정사각형 → 리사이즈해도 비율 유지
-
-    if vertical_anchor == "top":
-        y1, y2 = 0, crop_h
-    else:
-        y2 = h  # 기본값: 이미지 맨 아래부터
-        y1 = y2 - crop_h
-
-    cx = int(w * _CENTER_XR)
-    x1 = cx - crop_w // 2
-    x2 = x1 + crop_w
-
-    # 이미지 경계 보정
-    if y1 < 0:
-        y1, y2 = 0, crop_h
-    if x1 < 0:
-        x1, x2 = 0, crop_w
-    if x2 > w:
-        x1, x2 = w - crop_w, w
-
-    crop = img[y1:y2, x1:x2]
-    crop = Image.fromarray(crop).resize((out_size, out_size), Image.LANCZOS)
-    return np.array(crop)
+def load_image(image_path: Path):
+    """jpg 이미지 파일을 읽어서 256x256 RGB numpy array로 변환"""
+    image = Image.open(image_path).convert("RGB")
+    image = image.resize((256, 256))
+    return np.array(image)
 
 
 def main(
@@ -106,33 +75,33 @@ def main(
             # 기존 LIBERO image
             # "image": {
             #     "dtype": "image",
-            #     "shape": (224, 224, 3),
+            #     "shape": (256, 256, 3),
             #     "names": ["height", "width", "channel"],
             # },
 
             # GARO top camera
             "observation.images.top": {
                 "dtype": "image",
-                "shape": (224, 224, 3),
+                "shape": (256, 256, 3),
                 "names": ["height", "width", "channel"],
             },
 
             # 기존 LIBERO wrist_image 1개
             # "wrist_image": {
             #     "dtype": "image",
-            #     "shape": (224, 224, 3),
+            #     "shape": (256, 256, 3),
             #     "names": ["height", "width", "channel"],
             # },
 
             # GARO wrist camera 2개
             "observation.images.wrist_right": {
                 "dtype": "image",
-                "shape": (224, 224, 3),
+                "shape": (256, 256, 3),
                 "names": ["height", "width", "channel"],
             },
             "observation.images.wrist_left": {
                 "dtype": "image",
-                "shape": (224, 224, 3),
+                "shape": (256, 256, 3),
                 "names": ["height", "width", "channel"],
             },
 
@@ -195,61 +164,26 @@ def main(
             continue
 
         with open(episode_json, "r") as f:
-            loaded = json.load(f)
-        steps = loaded["steps"] if isinstance(loaded, dict) and "steps" in loaded else loaded
+            steps = json.load(f)
 
-        valid_frames = 0
-        skipped_frames = 0
-
-        for step_idx, step in enumerate(steps):
-            top_rel = step.get("observation.images.top")
-            wrist_right_rel = step.get("observation.images.wrist_right")
-            if top_rel is None or wrist_right_rel is None:
-                skipped_frames += 1
-                if skipped_frames <= 3:
-                    print(f"warn: {episode_dir.name} step={step_idx} missing camera path key")
-                continue
-
-            top_path = episode_dir / top_rel
-            wrist_right_path = episode_dir / wrist_right_rel
-            if not top_path.exists() or not wrist_right_path.exists():
-                skipped_frames += 1
-                if skipped_frames <= 3:
-                    print(
-                        f"warn: {episode_dir.name} step={step_idx} missing image file "
-                        f"(top={top_path.exists()}, wrist_right={wrist_right_path.exists()})"
-                    )
-                continue
-
-            if "observation.images.wrist_left" in step:
-                wrist_left_path = episode_dir / step["observation.images.wrist_left"]
-                if wrist_left_path.exists():
-                    wrist_left = load_image(wrist_left_path)
-                else:
-                    wrist_left = np.zeros((224, 224, 3), dtype=np.uint8)
-            else:
-                wrist_left = np.zeros((224, 224, 3), dtype=np.uint8)
+        for step in steps:
+            top_path = episode_dir / step["observation.images.top"]
+            wrist_right_path = episode_dir / step["observation.images.wrist_right"]
+            wrist_left_path = episode_dir / step["observation.images.wrist_left"]
 
             dataset.add_frame(
                 {
                     "observation.images.top": load_image(top_path),
-                    "observation.images.wrist_right": load_image(
-                        wrist_right_path, vertical_anchor="top"
-                    ),
-                    "observation.images.wrist_left": wrist_left,
+                    "observation.images.wrist_right": load_image(wrist_right_path),
+                    "observation.images.wrist_left": load_image(wrist_left_path),
                     "state": np.array(step["observation.state"], dtype=np.float32),
                     "actions": np.array(step["action"], dtype=np.float32),
                     "task": step["task"],
                 }
             )
-            valid_frames += 1
-
-        if valid_frames == 0:
-            print(f"skip: {episode_dir} has no valid frames (steps={len(steps)})")
-            continue
 
         dataset.save_episode()
-        print(f"saved {episode_dir.name}, frames={valid_frames}, skipped={skipped_frames}")
+        print(f"saved {episode_dir.name}, frames={len(steps)}")
 
     if push_to_hub:
         dataset.push_to_hub(

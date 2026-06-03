@@ -228,6 +228,9 @@ import torch
 
 @dataclasses.dataclass(frozen=True)
 class GaroInputs(_transforms.DataTransformFn):
+    # If true, always mask out left wrist image regardless of availability/content.
+    mask_left_wrist: bool = False
+
     def __call__(self, data: dict) -> dict:
         def to_image_array(x):
             if isinstance(x, torch.Tensor):
@@ -251,24 +254,43 @@ class GaroInputs(_transforms.DataTransformFn):
 
             return x
 
+        top = to_image_array(data.pop("observation.images.top"))
+        left_raw = data.pop("observation.images.wrist_left", None)
+        right_raw = data.pop("observation.images.wrist_right", None)
+
+        left = to_image_array(left_raw) if left_raw is not None else np.zeros_like(top)
+        right = to_image_array(right_raw) if right_raw is not None else np.zeros_like(top)
+
+        left_valid = (left_raw is not None) and (not self.mask_left_wrist)
+        right_valid = right_raw is not None
+
         data["image"] = {
-            "top": to_image_array(data.pop("observation.images.top")),
-            "wrist_left": to_image_array(data.pop("observation.images.wrist_left")),
-            "wrist_right": to_image_array(data.pop("observation.images.wrist_right")),
+            "base_0_rgb": top,
+            "left_wrist_0_rgb": left,
+            "right_wrist_0_rgb": right,
         }
 
-        # 샘플 단위에서는 scalar bool이어야 함. 배치 후 자동으로 (16,) 됨.
         data["image_mask"] = {
-            "top": np.array(True, dtype=bool),
-            "wrist_left": np.array(True, dtype=bool),
-            "wrist_right": np.array(True, dtype=bool),
+            "base_0_rgb": np.array(True, dtype=bool),
+            "left_wrist_0_rgb": np.array(left_valid, dtype=bool),
+            "right_wrist_0_rgb": np.array(right_valid, dtype=bool),
         }
 
         data["state"] = np.asarray(data.pop("observation.state"), dtype=np.float32)
-        data["actions"] = np.asarray(data.pop("action"), dtype=np.float32)
+        # "action" is only available during training dataset loading.
+        if "action" in data:
+            data["actions"] = np.asarray(data.pop("action"), dtype=np.float32)
 
         return data
-    
+
+
+@dataclasses.dataclass(frozen=True)
+class GaroOutputs(_transforms.DataTransformFn):
+    def __call__(self, data: dict) -> dict:
+        # 모델에서 나오는 action의 dimension이 32일 수 있으므로 상단 16만 추출
+        return {"actions": np.asarray(data["actions"][:, :16])}
+
+
 @dataclasses.dataclass(frozen=True)
 class GaroDataConfig(DataConfigFactory):
     """GARO LeRobot dataset용 DataConfig.
@@ -279,25 +301,31 @@ class GaroDataConfig(DataConfigFactory):
     - 그래서 GARO용 create()를 직접 정의한다.
     """
 
+    # If true, left wrist camera is ignored (mask=False) and not required in the dataset.
+    mask_left_wrist: bool = False
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_map: dict[str, str] = {
+            # 이미지
+            "observation.images.top": "observation.images.top",
+            "observation.images.wrist_right": "observation.images.wrist_right",
+
+            # state / action
+            "observation.state": "state",
+            "action": "actions",
+
+            # prompt
+            "prompt": "task",
+        }
+        if not self.mask_left_wrist:
+            repack_map["observation.images.wrist_left"] = "observation.images.wrist_left"
+
         # GARO 데이터셋 key를 openpi 모델이 기대하는 key로 바꿔줌
         repack_transform = _transforms.Group(
             inputs=[
                 _transforms.RepackTransform(
-                    {
-                        # 이미지 (그대로 매핑)
-                        "observation.images.top": "observation.images.top",
-                        "observation.images.wrist_left": "observation.images.wrist_left",
-                        "observation.images.wrist_right": "observation.images.wrist_right",
-
-                        # state / action
-                        "observation.state": "state",
-                        "action": "actions",
-
-                        # prompt
-                        "prompt": "task",
-                    }
+                    repack_map
                 )
             ]
         )
@@ -309,7 +337,8 @@ class GaroDataConfig(DataConfigFactory):
             self.create_base_config(assets_dirs, model_config),
             repack_transforms=repack_transform,
             data_transforms=_transforms.Group(
-                inputs=[GaroInputs()],
+                inputs=[GaroInputs(mask_left_wrist=self.mask_left_wrist)],
+                outputs=[GaroOutputs()],
             ),
             model_transforms=model_transforms,
 
@@ -320,6 +349,142 @@ class GaroDataConfig(DataConfigFactory):
             action_sequence_keys=("actions",),
 
             # task 필드에서 prompt 가져오기
+            prompt_from_task=True,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class GaroExternalInputs(_transforms.DataTransformFn):
+    """Inputs transform for external (features.json-style) datasets.
+
+    This transform will prefer an `image_mask` dict if present in the data. If no
+    mask is provided, it falls back to a simple non-zero-image check.
+
+    If mask_left_wrist=True, left_wrist_0_rgb is always masked out regardless of image content.
+    """
+    # mask_left_wrist: bool = False 필드 추가
+    mask_left_wrist: bool = True
+
+    def __call__(self, data: dict) -> dict:
+        def to_image_array(x):
+            if isinstance(x, torch.Tensor):
+                x = x.cpu().numpy()
+            x = np.asarray(x)
+
+            # CHW -> HWC
+            if x.ndim == 3 and x.shape[0] in [1, 3, 4]:
+                x = np.transpose(x, (1, 2, 0))
+
+            # If NCHW with batch dim 1, use first frame
+            if x.ndim == 4 and x.shape[0] == 1:
+                x = x[0]
+                if x.shape[0] in [1, 3, 4]:
+                    x = np.transpose(x, (1, 2, 0))
+
+            if x.dtype != np.uint8:
+                if x.max() <= 1.0:
+                    x = x * 255.0
+                x = np.clip(x, 0, 255).astype(np.uint8)
+
+            return x
+
+        def has_image(arr: np.ndarray) -> bool:
+            a = np.asarray(arr)
+            return a.size != 0 and int(a.sum()) != 0
+
+        # Accept optional mask written by conversion step. Support flexible keys.
+        raw_mask = data.pop("image_mask", None)
+        if raw_mask is None:
+            raw_mask = data.pop("observation.image_mask", None)
+
+        top = to_image_array(data.pop("observation.images.top"))
+        left_raw = data.pop("observation.images.wrist_left", None)
+        right_raw = data.pop("observation.images.wrist_right", None)
+        left = to_image_array(left_raw) if left_raw is not None else np.zeros_like(top)
+        right = to_image_array(right_raw) if right_raw is not None else np.zeros_like(top)
+
+        data["image"] = {
+            "base_0_rgb": top,
+            "left_wrist_0_rgb": left,
+            "right_wrist_0_rgb": right,
+        }
+
+        def mask_lookup(keys: list[str]) -> object | None:
+            if isinstance(raw_mask, dict):
+                for k in keys:
+                    if k in raw_mask:
+                        return raw_mask[k]
+            return None
+
+        top_mask = mask_lookup(["top", "observation.images.top", "base_0_rgb"]) 
+        left_mask = mask_lookup(["wrist_left", "observation.images.wrist_left", "left_wrist_0_rgb"])
+        right_mask = mask_lookup(["wrist_right", "observation.images.wrist_right", "right_wrist_0_rgb"])
+
+        def as_bool(mv, arr):
+            if mv is None:
+                return has_image(arr)
+            if isinstance(mv, (np.ndarray, list, tuple)):
+                return bool(np.asarray(mv).any())
+            return bool(mv)
+        
+        # 이미지 내용과 무관하게 left_wrist_0_rgb 마스크를 항상 False로 고정
+        data["image_mask"] = {
+            "base_0_rgb": np.array(as_bool(top_mask, top), dtype=bool),
+            "left_wrist_0_rgb": np.array(False if self.mask_left_wrist else as_bool(left_mask, left), dtype=bool),
+            "right_wrist_0_rgb": np.array(as_bool(right_mask, right), dtype=bool),
+        }
+
+        data["state"] = np.asarray(data.pop("observation.state"), dtype=np.float32)
+        # "action" is only available during training dataset loading.
+        if "action" in data:
+            data["actions"] = np.asarray(data.pop("action"), dtype=np.float32)
+
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class GaroExternalDataConfig(DataConfigFactory):
+    """DataConfig factory for external GARO-style LeRobot datasets.
+
+    Uses `GaroExternalInputs` so that precomputed `image_mask` values are respected
+    when present.
+    """
+
+    # If true, left wrist camera is ignored (mask=False) and not required in the dataset.
+    mask_left_wrist: bool = True
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_map: dict[str, str] = {
+            "observation.images.top": "observation.images.top",
+            "observation.images.wrist_right": "observation.images.wrist_right",
+            "observation.state": "state",
+            "action": "actions",
+            "prompt": "task",
+        }
+        if not self.mask_left_wrist:
+            repack_map["observation.images.wrist_left"] = "observation.images.wrist_left"
+
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    repack_map
+                )
+            ]
+        )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=_transforms.Group(
+                inputs=[GaroExternalInputs(mask_left_wrist=self.mask_left_wrist)],
+                outputs=[GaroOutputs()],
+            ),
+            model_transforms=model_transforms,
+            use_quantile_norm=False,
+            action_sequence_keys=("actions",),
             prompt_from_task=True,
         )
     
@@ -624,6 +789,9 @@ class TrainConfig:
     # If true, will enable wandb logging.
     wandb_enabled: bool = True
 
+    # Optional W&B entity (user or team). If None, W&B uses your default entity.
+    wandb_entity: str | None = None
+
     # Used to pass metadata to the policy server.
     policy_metadata: dict[str, Any] | None = None
 
@@ -632,6 +800,10 @@ class TrainConfig:
     # eg. if total device is 4 and fsdp devices is 2; then the model will shard to 2 devices and run
     # data parallel between 2 groups of devices.
     fsdp_devices: int = 1
+
+    # If set, will save a checkpoint whenever loss falls below this threshold (in addition to periodic saves).
+    # Set to None to disable best loss checkpointing.
+    best_loss_threshold: float | None = None
 
     @property
     def assets_dirs(self) -> pathlib.Path:
@@ -677,7 +849,8 @@ _CONFIGS = [
         # GARO LeRobot dataset을 읽는 설정
         # repo_id는 convert_garo_to_lerobot.py의 REPO_NAME="garo_pi05"와 맞춰야 함
         data=GaroDataConfig(
-            repo_id="pi05_v01",
+            repo_id="pi05_v02",
+            mask_left_wrist=True,
         ),
 
         # Pi0.5 base checkpoint에서 fine-tuning 시작
@@ -688,18 +861,21 @@ _CONFIGS = [
         # 첫 실험용 안정 세팅
         # 이후 잘 돌면 peak_lr=2.5e-5도 실험 가능
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=10_000,
-            peak_lr=1.25e-5,
-            decay_steps=80_000,
-            decay_lr=2.5e-6,
+            warmup_steps=1_000,
+            peak_lr=1.25e-05,
+            decay_steps=20_000,
+            decay_lr=2.5e-06,
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
 
         num_train_steps=20_000,
         batch_size=16,
         num_workers=0,
-        save_interval=10_000,
+        save_interval=5_000,
         log_interval=20,
+        # Loss threshold: save checkpoint when loss < 10
+        best_loss_threshold=10.0,
+        #fsdp_devices=2,
     ),
     #
     # Inference Aloha configs.
@@ -1034,6 +1210,72 @@ _CONFIGS = [
         save_interval=5000,
         keep_period=10_000,
         num_workers=0,  # Important: RLDS DataLoader requires num_workers=0, handles multi-processing internally
+    ),
+    TrainConfig(
+        # This config is for pretraining pi05 on a merged LeRobot dataset built from:
+        # - /home/reality/seungmi/datasets/processed
+        # - /home/reality/seungmi/datasets/language_sim
+        # - /home/reality/seungmi/datasets/language_real
+        # The three sources must be converted into the same LeRobot schema before training.
+        name="pi05_pretrain_mixed",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            discrete_state_input=False,
+        ),
+        data=GaroExternalDataConfig(
+            repo_id="pi05_pretrain_mixed",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=1.25e-5,
+            decay_steps=20_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        num_train_steps=50_000,
+        batch_size=32,
+        num_workers=0,
+        save_interval=500,
+        log_interval=50,
+        best_loss_threshold=None,
+    ),
+    TrainConfig(
+        # Variant of pi05_pretrain_mixed that points to the lt400 merged dataset.
+        name="pi05_pretrain_mixed_lt400",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            discrete_state_input=False,
+        ),
+        data=GaroExternalDataConfig(
+            repo_id="/home/reality/seungmi/datasets/pi05_pretrain_mixed_lt400",
+            assets=AssetsConfig(
+                assets_dir="/home/reality/seungmi/openpi/assets/pi05_pretrain_mixed",
+                asset_id="pi05_pretrain_mixed",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=1.25e-5,
+            decay_steps=20_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        num_train_steps=50_000,
+        batch_size=32,
+        num_workers=0,
+        save_interval=500,
+        log_interval=50,
+        best_loss_threshold=None,
     ),
     TrainConfig(
         # This config is for fine-tuning pi05-DROID on a custom (smaller) DROID dataset.

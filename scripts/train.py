@@ -55,16 +55,36 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
     ckpt_dir = config.checkpoint_dir
     if not ckpt_dir.exists():
         raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
-    if resuming:
-        run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
-        wandb.init(id=run_id, resume="must", project=config.project_name)
-    else:
-        wandb.init(
-            name=config.exp_name,
-            config=dataclasses.asdict(config),
-            project=config.project_name,
+
+    init_kwargs: dict[str, Any] = {"project": config.project_name}
+    if config.wandb_entity is not None:
+        init_kwargs["entity"] = config.wandb_entity
+
+    try:
+        if resuming:
+            run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
+            wandb.init(id=run_id, resume="must", **init_kwargs)
+        else:
+            wandb.init(
+                name=config.exp_name,
+                config=dataclasses.asdict(config),
+                **init_kwargs,
+            )
+            (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
+    except wandb.errors.CommError as err:
+        if "permission denied" not in str(err).lower():
+            raise
+
+        entity_info = f", entity='{config.wandb_entity}'" if config.wandb_entity else ""
+        logging.warning(
+            "W&B init failed with permission denied (project='%s'%s). "
+            "Falling back to disabled W&B mode. "
+            "Set --wandb_entity to an entity you can write to, or disable W&B with --wandb_enabled=false.",
+            config.project_name,
+            entity_info,
         )
-        (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
+        wandb.init(mode="disabled")
+        return
 
     if log_code:
         wandb.run.log_code(epath.Path(__file__).parent.parent)
@@ -226,12 +246,12 @@ def main(config: _config.TrainConfig):
     batch = next(data_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
-    # Log images from first batch to sanity check.
-    images_to_log = [
-        wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
-        for i in range(min(5, len(next(iter(batch[0].images.values())))))
-    ]
-    wandb.log({"camera_views": images_to_log}, step=0)
+    # # Log images from first batch to sanity check.
+    # images_to_log = [
+    #     wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
+    #     for i in range(min(5, len(next(iter(batch[0].images.values())))))
+    # ]
+    # wandb.log({"camera_views": images_to_log}, step=0)
 
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)
